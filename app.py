@@ -32,6 +32,44 @@ PO_COLUMN_WIDTHS = {
     "A": 15.14, "B": 19.0, "C": 10.29, "D": 9.86,
     "E": 58.86, "F": 4.0,  "G": 10.71, "H": 7.71, "I": 10.71,
 }
+
+# --- Constants matching the Catalogue Lines template --------------------
+
+CATALOGUE_HEADERS = [
+    "Catalogue Part No\n(text 20)",
+    "Supplier Part No\n(text 30)",
+    "Description\n(*text 100)",
+    "Activity Code\n(*text 10)",
+    "Specification\n(text 2000)",
+    "Favourite\n(integer)",
+    "Promotional\n(integer)",
+    "Cost Rate\n(number)",
+    "Sell Rate\n(number)",
+    "Unit\n(text 10)",
+    "Negotiated % Disct\n(number)",
+    "Negotiated Date\n(date)",
+    "Last Invoice No\n(text 10)",
+    "Last Invoice Cost\n(number)",
+    "Negotiated Date\n(date)",
+    "Bill Type\n(text 2)",
+    "Group Code\n(text 10)",
+    "SubCategory Code\n(text 10)",
+    "Category Code\n(text 10)",
+    "Inventory Code\n(text 20)",
+    "Inactive\n(integer)",
+    "Supplier\n(integer)",
+    "Currency Code\n(*text 10)",
+]
+CATALOGUE_COLUMN_WIDTHS = {
+    "A": 20.57, "B": 20.71, "C": 58.86, "D": 10.29, "E": 40.71,
+    "F": 10.71, "G": 10.71, "H": 10.71, "I": 10.71, "J": 7.71,
+    "K": 14.71, "L": 12.71, "M": 11.71, "N": 12.71, "O": 12.71,
+    "P": 7.71,  "Q": 9.14,  "R": 13.86, "S": 11.14, "T": 11.57,
+    "U": 10.71, "V": 10.71, "W": 11.0,
+}
+DEFAULT_CURRENCY = "AUD"
+SUPPLIER_PART_PREFIX_LEN = 3  # strip first 3 chars of part no for supplier ref
+
 HEADER_FILL = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFFFF")
 DEFAULT_WORK_CENTRE = "WC004"
@@ -99,6 +137,62 @@ def build_po_xlsx(items, job_code: str, activity_code: str) -> bytes:
 
     # Column widths from the template
     for col, width in PO_COLUMN_WIDTHS.items():
+        ws.column_dimensions[col].width = width
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def build_catalogue_xlsx(items, activity_code: str) -> bytes:
+    """Write items into the Catalogue Lines template layout in memory.
+
+    Columns filled per item:
+      A — Catalogue Part No  (raw part number)
+      B — Supplier Part No   (part number with first 3 chars stripped)
+      C — Description
+      D — Activity Code      (optional, from UI)
+      H — Cost Rate          (= unit_price / per — true per-unit cost)
+      J — Unit               (UOM)
+      W — Currency Code      (always 'AUD')
+
+    All other columns are left blank for the user to fill in if needed.
+    Items without a part number (e.g. freight rows from Ideal) are skipped
+    — the catalogue is for physical stocked items, freight isn't one.
+    """
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Sheet1"
+
+    # Header row — same styling as the PO file
+    ws.append(CATALOGUE_HEADERS)
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+    ws.row_dimensions[1].height = 45
+
+    # Data rows
+    for it in items:
+        part = it["part"]
+        if not part:
+            # Skip freight rows etc. — they don't belong in a parts catalogue
+            continue
+        supplier_part = part[SUPPLIER_PART_PREFIX_LEN:] if len(part) > SUPPLIER_PART_PREFIX_LEN else ""
+        unit_cost = it["unit_price"] / it["per"]
+        # 23 columns total (A-W); only A, B, C, D, H, J, W are populated.
+        row = [None] * 23
+        row[0] = part                       # A — Catalogue Part No
+        row[1] = supplier_part or None      # B — Supplier Part No (None if part ≤3 chars)
+        row[2] = it["description"] or None  # C — Description
+        row[3] = activity_code or None      # D — Activity Code
+        row[7] = unit_cost                  # H — Cost Rate
+        row[9] = it["uom"] or None          # J — Unit
+        row[22] = DEFAULT_CURRENCY          # W — Currency Code
+        ws.append(row)
+
+    # Column widths
+    for col, width in CATALOGUE_COLUMN_WIDTHS.items():
         ws.column_dimensions[col].width = width
 
     buf = io.BytesIO()
@@ -185,21 +279,36 @@ st.dataframe(
     hide_index=True,
 )
 
-# Build PO xlsx in memory
-xlsx_bytes = build_po_xlsx(items, job_code.strip(), activity_code.strip())
+# Build both xlsx files in memory
+po_xlsx_bytes = build_po_xlsx(items, job_code.strip(), activity_code.strip())
+catalogue_xlsx_bytes = build_catalogue_xlsx(items, activity_code.strip())
 
-# Filename: <original-pdf-name>-PO.xlsx
-out_name = Path(uploaded.name).stem + "-PO.xlsx"
+# Filenames mirror the input PDF
+pdf_stem = Path(uploaded.name).stem
+po_out_name = pdf_stem + "-PO.xlsx"
+catalogue_out_name = pdf_stem + "-Catalogue.xlsx"
 
-st.download_button(
-    label="⬇️  Download Purchase Order Excel",
-    data=xlsx_bytes,
-    file_name=out_name,
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    type="primary",
-)
+# Two download buttons side-by-side
+dl_col1, dl_col2 = st.columns(2)
+with dl_col1:
+    st.download_button(
+        label="⬇️  Purchase Order",
+        data=po_xlsx_bytes,
+        file_name=po_out_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+with dl_col2:
+    st.download_button(
+        label="⬇️  Catalogue Lines",
+        data=catalogue_xlsx_bytes,
+        file_name=catalogue_out_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 st.caption(
-    f"Work Centre is set to **{DEFAULT_WORK_CENTRE}** for every row. "
+    f"Work Centre is set to **{DEFAULT_WORK_CENTRE}** for every row in the PO file. "
     "Job Code, Activity Code, and Details can be edited in Excel after download."
 )
