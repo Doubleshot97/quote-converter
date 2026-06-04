@@ -79,7 +79,7 @@ HAYMANS_ITEM_RE = re.compile(
     r"""^\s*
         (?P<line_no>\d+)\s+              # line number (e.g. 5, 10, 15)
         \#?                              # optional leading '#' marker (stripped)
-        (?P<part>[A-Z0-9][A-Z0-9\-/.]*)\s+   # part number (alphanumeric + dashes)
+        (?P<part>[A-Z0-9][A-Z0-9\-/.+]*)\s+  # part number (alphanumeric, -, /, ., +)
         (?P<qty>[\d,]+\.\d+)\s+          # quantity (e.g. 1.000)
         (?P<uom>[A-Za-z]{1,4})\s+        # unit of measure
         (?P<unit_price>[\d,]+\.\d+)\s+   # unit price
@@ -115,12 +115,38 @@ HAYMANS_SKIP_RE = re.compile(
     re.VERBOSE | re.IGNORECASE,
 )
 
+# Haymans freight charge row, e.g.:  "Freight 2.50 25.00"
+# Two numbers: GST amount, line value (= the freight cost).
+HAYMANS_FREIGHT_RE = re.compile(
+    r"""^\s*Freight\s+
+        (?P<gst>[\d,]+\.\d+)\s+
+        (?P<line_value>[\d,]+\.\d+)\s*$""",
+    re.VERBOSE | re.IGNORECASE,
+)
+
 
 def _parse_haymans(lines):
     """Parser for Haymans / Cetnaj layout."""
     items = []
     i = 0
     while i < len(lines):
+        # Haymans freight rows appear as a standalone line: "Freight 2.50 25.00"
+        # No part number, no qty/UOM column — just GST + line value. Add as a
+        # freight item with no Part No so the catalogue output skips it but
+        # the PO output includes it.
+        fm = HAYMANS_FREIGHT_RE.match(lines[i])
+        if fm:
+            items.append({
+                "part": "",
+                "qty": 1,
+                "uom": "",
+                "unit_price": _to_number(fm.group("line_value")),
+                "per": 1,
+                "description": "Freight",
+            })
+            i += 1
+            continue
+
         m = HAYMANS_ITEM_RE.match(lines[i])
         if not m:
             i += 1
@@ -146,6 +172,9 @@ def _parse_haymans(lines):
                 j = len(lines)
                 break
             if HAYMANS_ITEM_RE.match(lines[j]):
+                break
+            if HAYMANS_FREIGHT_RE.match(lines[j]):
+                # Stop here so the outer loop captures the freight row.
                 break
             if HAYMANS_SKIP_RE.match(nxt):
                 j += 1
@@ -398,7 +427,10 @@ def parse_quote_pdf(pdf_source):
     """Top-level entry point.
 
     Detects supplier and dispatches to the matching parser. Returns a
-    list of dicts with keys: part, description, qty, uom, unit_price, per.
+    list of dicts with keys: part, description, qty, uom, unit_price, per,
+    supplier. The 'supplier' key is one of: 'haymans', 'cetnaj', 'ideal',
+    or None when the supplier couldn't be identified (unknown layout, but
+    parsed via the Haymans fallback).
 
     Accepts a Path/string filename, raw bytes, or a file-like object.
 
@@ -410,10 +442,17 @@ def parse_quote_pdf(pdf_source):
     supplier = _detect_supplier(lines)
 
     if supplier == "ideal":
-        return _parse_ideal(lines)
+        items = _parse_ideal(lines)
+    else:
+        # Haymans, Cetnaj, and unknown fallback all use the same parser.
+        items = _parse_haymans(lines)
 
-    # Haymans, Cetnaj, and unknown fallback all use the same parser
-    return _parse_haymans(lines)
+    # Tag each item with the detected supplier so downstream code (the
+    # catalogue builder) can apply supplier-specific rules.
+    for it in items:
+        it["supplier"] = supplier
+
+    return items
 
 
 # =========================================================================
