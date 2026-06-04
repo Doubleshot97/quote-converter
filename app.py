@@ -6,6 +6,7 @@ Ideal Electrical layouts (auto-detected).
 
 import hashlib
 import io
+import re
 from pathlib import Path
 
 import streamlit as st
@@ -68,11 +69,36 @@ CATALOGUE_COLUMN_WIDTHS = {
     "U": 10.71, "V": 10.71, "W": 11.0,
 }
 DEFAULT_CURRENCY = "AUD"
-SUPPLIER_PART_PREFIX_LEN = 3  # strip first 3 chars of part no for supplier ref
 
 HEADER_FILL = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFFFF")
 DEFAULT_WORK_CENTRE = "WC004"
+
+# Suppliers whose part numbers carry a 3-character prefix that should be
+# stripped to produce the "Supplier Part No" (column B in the catalogue).
+# Example: "SPFCTR-60C-5R" → "CTR-60C-5R" (Haymans/Cetnaj convention).
+_PREFIX_STRIP_SUPPLIERS = {"haymans", "cetnaj", "ideal"}
+
+# Pattern matching freight-charge codes for Haymans / Cetnaj, e.g.
+# "SPF-FREIGHT", "BUN-FREIGHT", "APS-FREIGHT". These look like real part
+# numbers but they're supplier-specific freight line items, not stocked
+# parts, so we leave column B blank for them.
+_FREIGHT_PART_RE = re.compile(r"^[A-Z0-9]{1,4}-FREIGHT$", re.IGNORECASE)
+
+
+def _supplier_part_no(part: str, supplier: str | None) -> str:
+    """Return the value to put in 'Supplier Part No' (catalogue column B).
+
+    See the docstring on build_catalogue_xlsx for the full rule list.
+    """
+    if supplier not in _PREFIX_STRIP_SUPPLIERS:
+        return ""
+    # Haymans / Cetnaj freight codes like "SPF-FREIGHT" stay blank.
+    if supplier in ("haymans", "cetnaj") and _FREIGHT_PART_RE.match(part):
+        return ""
+    if len(part) <= 3:
+        return ""
+    return part[3:]
 
 
 # --- Page setup ----------------------------------------------------------
@@ -148,17 +174,27 @@ def build_catalogue_xlsx(items, activity_code: str) -> bytes:
     """Write items into the Catalogue Lines template layout in memory.
 
     Columns filled per item:
-      A — Catalogue Part No  (raw part number)
-      B — Supplier Part No   (part number with first 3 chars stripped)
+      A — Catalogue Part No  (raw part number, all suppliers)
+      B — Supplier Part No   (rules vary by supplier — see below)
       C — Description
       D — Activity Code      (optional, from UI)
       H — Cost Rate          (= unit_price / per — true per-unit cost)
       J — Unit               (UOM)
       W — Currency Code      (always 'AUD')
 
+    Column B rules:
+      * Haymans / Cetnaj: first 3 chars of part number stripped (e.g.
+        "SPFCTR-60C-5R" → "CTR-60C-5R"). Exception: freight-charge codes
+        of the form "XXX-FREIGHT" leave column B blank — supplier-specific
+        freight charges aren't real catalogue parts.
+      * Ideal: first 3 chars stripped. Ideal freight rows have no part
+        number at all (they're "Charges Freight ..." lines) so they're
+        already excluded earlier by the "if not part" check.
+      * Other suppliers (unknown layout, fallback parser): column B blank.
+
     All other columns are left blank for the user to fill in if needed.
-    Items without a part number (e.g. freight rows from Ideal) are skipped
-    — the catalogue is for physical stocked items, freight isn't one.
+    Items without a part number (e.g. generic Haymans 'Freight' rows) are
+    skipped entirely — the catalogue is for physical stocked items.
     """
     wb = Workbook()
     ws = wb.active
@@ -176,14 +212,13 @@ def build_catalogue_xlsx(items, activity_code: str) -> bytes:
     for it in items:
         part = it["part"]
         if not part:
-            # Skip freight rows etc. — they don't belong in a parts catalogue
+            # Skip rows with no part number (generic 'Freight' lines etc.)
             continue
-        supplier_part = part[SUPPLIER_PART_PREFIX_LEN:] if len(part) > SUPPLIER_PART_PREFIX_LEN else ""
         unit_cost = it["unit_price"] / it["per"]
-        # 23 columns total (A-W); only A, B, C, D, H, J, W are populated.
+        supplier_part = _supplier_part_no(part, it.get("supplier"))
         row = [None] * 23
         row[0] = part                       # A — Catalogue Part No
-        row[1] = supplier_part or None      # B — Supplier Part No (None if part ≤3 chars)
+        row[1] = supplier_part or None      # B — Supplier Part No
         row[2] = it["description"] or None  # C — Description
         row[3] = activity_code or None      # D — Activity Code
         row[7] = unit_cost                  # H — Cost Rate
