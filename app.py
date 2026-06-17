@@ -6,12 +6,14 @@ IPD Group, Phoenix Contact, and Mechtric layouts — auto-detected from
 PDF content.
 """
 
+import base64
 import hashlib
 import io
 import re
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
@@ -344,20 +346,62 @@ pdf_stem = Path(uploaded.name).stem
 po_out_name = pdf_stem + "-PO.xlsx"
 catalogue_out_name = pdf_stem + "-Catalogue.xlsx"
 
-# Two download buttons side-by-side
-dl_col1, dl_col2 = st.columns(2)
-with dl_col1:
+# --- Single "Download both" button -------------------------------------
+#
+# Browsers limit a button click to one native download. We work around
+# that by injecting a tiny HTML+JS component that contains both files
+# as base64 data URLs and auto-clicks two hidden anchor tags — one for
+# the PO file, one for the Catalogue file. Works in Chrome and Edge
+# (and modern Firefox after a one-time "allow multiple downloads"
+# prompt). If a browser blocks the second download silently, the user
+# can fall back to the per-file links shown below the button.
+
+if st.button(
+    "⬇️  Download both files",
+    type="primary",
+    use_container_width=True,
+):
+    po_b64 = base64.b64encode(po_xlsx_bytes).decode()
+    cat_b64 = base64.b64encode(catalogue_xlsx_bytes).decode()
+    xlsx_mime = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    # The hidden anchors get auto-clicked on render. A small delay between
+    # the two clicks improves reliability in browsers that throttle rapid
+    # programmatic downloads.
+    components.html(
+        f"""
+        <html><body>
+        <a id="dl1" href="data:{xlsx_mime};base64,{po_b64}"
+           download="{po_out_name}" style="display:none">PO</a>
+        <a id="dl2" href="data:{xlsx_mime};base64,{cat_b64}"
+           download="{catalogue_out_name}" style="display:none">Catalogue</a>
+        <script>
+          document.getElementById('dl1').click();
+          setTimeout(function() {{
+            document.getElementById('dl2').click();
+          }}, 400);
+        </script>
+        </body></html>
+        """,
+        height=0,
+    )
+
+# Fallback per-file links — small text below the button so the user
+# always has a way to grab each file individually if their browser
+# blocked the combined download or they just want one of the two.
+fb_col1, fb_col2 = st.columns(2)
+with fb_col1:
     st.download_button(
-        label="⬇️  Purchase Order",
+        label="PO only",
         data=po_xlsx_bytes,
         file_name=po_out_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        type="primary",
         use_container_width=True,
     )
-with dl_col2:
+with fb_col2:
     st.download_button(
-        label="⬇️  Catalogue Lines",
+        label="Catalogue only",
         data=catalogue_xlsx_bytes,
         file_name=catalogue_out_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
