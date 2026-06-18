@@ -61,6 +61,19 @@ def _extract_lines(pdf_source):
     lines = []
     with pdfplumber.open(pdf_source) as pdf:
         for page in pdf.pages:
+            # Drop oversized watermark glyphs before extracting text. Diagonal
+            # "DRAFT" watermarks (NHP quotes, ~160pt light-grey letters) get
+            # interleaved into the text stream by pdfplumber, and *where* each
+            # letter lands depends on the pdfplumber/pdfminer version — so a
+            # quote that parses cleanly locally can silently drop lines once
+            # deployed on a different version. Real body text on these quotes
+            # is <= ~16pt, so filtering chars above 40pt removes the watermark
+            # without touching any legitimate content, for every supplier.
+            page = page.filter(
+                lambda obj: not (
+                    obj.get("object_type") == "char" and obj.get("size", 0) > 40
+                )
+            )
             text = page.extract_text(x_tolerance=2) or ""
             lines.extend(text.splitlines())
     return lines
