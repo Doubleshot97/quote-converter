@@ -915,7 +915,8 @@ def _parse_mechtric(lines):
 NHP_ITEM_RE = re.compile(
     r"""^\s*
         (?P<item_no>\d+\.\d{2})\s+               # item number (1.00, 3.50, etc.)
-        (?P<part>[A-Z][A-Z0-9]*)                 # part code (uppercase alphanumeric)
+        (?P<part>[A-Z0-9][A-Z0-9]*)              # part code (may start with digit
+                                                 #   e.g. 9404, 5534007424VDC)
         (?:\s+†)?                                # optional non-returnable marker
         \s+
         (?P<desc>.+?)\s+                         # description (lazy)
@@ -927,11 +928,27 @@ NHP_ITEM_RE = re.compile(
 )
 
 
+def _clean_nhp_watermark(line: str) -> str:
+    """Strip stray single-letter watermark fragments from a line.
+
+    NHP "DRAFT" watermarked PDFs leak single letters (D, R, A, F, T) into
+    extracted text — usually between description words and the qty. Pattern
+    observed: "... C CURVE T1 EA ..." should be "... C CURVE 1 EA ...".
+
+    We only strip a single uppercase letter that appears immediately before
+    a digit followed by " EA " — this is conservative enough not to corrupt
+    legitimate descriptions like "1NO" or "C/O".
+    """
+    return re.sub(r"\s[DRAFT](?=\d+\s+EA\s+)", " ", line)
+
+
 def _parse_nhp(lines):
     """Parser for NHP Electrical Engineering layout."""
     items = []
     for line in lines:
-        m = NHP_ITEM_RE.match(line)
+        # Pre-clean stray DRAFT watermark fragments
+        cleaned = _clean_nhp_watermark(line)
+        m = NHP_ITEM_RE.match(cleaned)
         if not m:
             continue
 
