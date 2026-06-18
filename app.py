@@ -2,8 +2,8 @@
 app.py — Streamlit web app for converting supplier PDF quotes into a
 Purchase Order Lines Excel template. Supports Haymans, Cetnaj, Ideal
 Electrical, Process Systems (valvesonline.com.au), APS Industrial,
-IPD Group, Phoenix Contact, and Mechtric layouts — auto-detected from
-PDF content.
+IPD Group, Phoenix Contact, Mechtric, NHP, and Dore Electrics layouts —
+auto-detected from PDF content.
 """
 
 import base64

@@ -897,6 +897,135 @@ def _parse_mechtric(lines):
 
 
 # =========================================================================
+# NHP ELECTRICAL ENGINEERING PARSER
+# =========================================================================
+# Columns: Item | Product | Description | Qty | Net (Ea) | Ext Net
+# Item numbers have a decimal format (1.00, 3.50, 6.50, 6.75, ...).
+# Each item fits on one line.
+# Some parts have a "†" non-returnable marker after the part code.
+# Prices can have comma thousand separators (e.g. 2,423.05).
+#
+# NHP displays the unit price rounded to 2 decimals, but the underlying
+# value can have more precision (observed: 22 × $16.71 = $367.62, but the
+# PDF says $367.54 for the line — so the real unit price is ~16.7064).
+# To make every line reconcile to the PDF's Ext Net column, the true unit
+# price is computed as line_total / qty rather than reading the displayed
+# unit price directly. This guarantees the subtotal matches the PDF exactly.
+
+NHP_ITEM_RE = re.compile(
+    r"""^\s*
+        (?P<item_no>\d+\.\d{2})\s+               # item number (1.00, 3.50, etc.)
+        (?P<part>[A-Z][A-Z0-9]*)                 # part code (uppercase alphanumeric)
+        (?:\s+†)?                                # optional non-returnable marker
+        \s+
+        (?P<desc>.+?)\s+                         # description (lazy)
+        (?P<qty>\d+)\s+EA\s+                     # quantity (always EA)
+        (?P<unit_price>[\d,]+\.\d+)\s+           # displayed unit price
+        \$(?P<line_total>[\d,]+\.\d+)\s*$        # Ext Net (authoritative)
+    """,
+    re.VERBOSE,
+)
+
+
+def _parse_nhp(lines):
+    """Parser for NHP Electrical Engineering layout."""
+    items = []
+    for line in lines:
+        m = NHP_ITEM_RE.match(line)
+        if not m:
+            continue
+
+        qty = int(m.group("qty"))
+        # Use Ext Net / qty to recover the true unit price — the displayed
+        # unit price is rounded for presentation and can be a cent or two
+        # off from the underlying value.
+        line_total = _to_number(m.group("line_total"))
+        true_unit_price = line_total / qty if qty else 0.0
+
+        items.append({
+            "part": m.group("part"),
+            "qty": qty,
+            "uom": "EA",
+            "unit_price": true_unit_price,
+            "per": 1,
+            "description": _clean_description(m.group("desc")),
+        })
+    return items
+
+
+# =========================================================================
+# DORE ELECTRICS PARSER
+# =========================================================================
+# Columns: Stock Code | Description | Quantity | Unit | Price | Disc% | Total Ex GST
+# Stock codes can start with letters OR digits (e.g. SM202, 165E24, E/NFEETBLK).
+# Unit is "PIEC" or "PCE" — both normalised to "EA".
+# Most lines have a Disc% column; a few don't (e.g. when there's no discount).
+# The displayed Price is BEFORE discount — true unit cost = line_total / qty.
+# This matches what the user prefers and avoids any rounding drift from the
+# Price × (1 - Disc%) math.
+#
+# "C/P F/O" rows (Credit Pickup / Freight Out admin note) appear with no qty
+# or price columns and are correctly ignored by the regex.
+
+# Item with discount: <part> <desc> <qty> <unit> <price> <disc> <line_total>
+DORE_ITEM_DISC_RE = re.compile(
+    r"""^\s*
+        (?P<part>[A-Z0-9][A-Z0-9/]*)\s+          # stock code (may start with digit)
+        (?P<desc>.+?)\s+                          # description (lazy)
+        (?P<qty>\d+\.\d+)\s+                      # quantity (e.g. 2.00)
+        (?P<unit>P[IC]E[C]?)\s+                   # PIEC or PCE
+        (?P<price>[\d,]+\.\d+)\s+                 # displayed price (pre-disc)
+        (?P<disc>\d+\.\d+)\s+                     # discount %
+        (?P<line_total>[\d,]+\.\d+)\s*$           # total ex GST
+    """,
+    re.VERBOSE,
+)
+
+# Item without discount column — same as above minus the disc field
+DORE_ITEM_NODISC_RE = re.compile(
+    r"""^\s*
+        (?P<part>[A-Z0-9][A-Z0-9/]*)\s+
+        (?P<desc>.+?)\s+
+        (?P<qty>\d+\.\d+)\s+
+        (?P<unit>P[IC]E[C]?)\s+
+        (?P<price>[\d,]+\.\d+)\s+
+        (?P<line_total>[\d,]+\.\d+)\s*$
+    """,
+    re.VERBOSE,
+)
+
+
+def _parse_dore(lines):
+    """Parser for Dore Electrics layout."""
+    items = []
+    for line in lines:
+        # Try with-discount first (more specific). If it doesn't match,
+        # fall back to the no-discount form. The order matters because the
+        # no-discount regex would also match a discount line — leaving the
+        # disc% inside the description.
+        m = DORE_ITEM_DISC_RE.match(line) or DORE_ITEM_NODISC_RE.match(line)
+        if not m:
+            continue
+
+        qty = float(m.group("qty"))
+        line_total = _to_number(m.group("line_total"))
+        # True unit cost = line total / qty. Avoids rounding drift from the
+        # displayed Price × (1 - Disc%) math, and matches the convention used
+        # for NHP (where displayed unit prices were also rounded).
+        true_unit_price = line_total / qty if qty else 0.0
+
+        items.append({
+            "part": m.group("part"),
+            "qty": int(qty) if qty == int(qty) else qty,
+            "uom": "EA",  # normalise PIEC/PCE → EA
+            "unit_price": true_unit_price,
+            "per": 1,
+            "description": _clean_description(m.group("desc")),
+        })
+    return items
+
+
+# =========================================================================
 # DISPATCHER
 # =========================================================================
 
@@ -914,6 +1043,8 @@ SUPPLIER_SIGNATURES = [
                 re.compile(r"Phoenix\s+Contact|phoenixcontact\.com", re.IGNORECASE)),
     ("mechtric",
                 re.compile(r"Mechtric\s+Pty|mechtric\.com", re.IGNORECASE)),
+    ("nhp",     re.compile(r"NHP\s+Electrical|nhp\.com\.au", re.IGNORECASE)),
+    ("dore",    re.compile(r"Dore\s+Electrics|doreelectrics\.com", re.IGNORECASE)),
 ]
 
 
@@ -956,6 +1087,10 @@ def parse_quote_pdf(pdf_source):
         items = _parse_phoenix_contact(lines)
     elif supplier == "mechtric":
         items = _parse_mechtric(lines)
+    elif supplier == "nhp":
+        items = _parse_nhp(lines)
+    elif supplier == "dore":
+        items = _parse_dore(lines)
     else:
         # Haymans, Cetnaj, and unknown fallback all use the same parser.
         items = _parse_haymans(lines)
