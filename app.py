@@ -1,9 +1,11 @@
 """
-app.py — Streamlit web app for converting supplier PDF quotes into a
-Purchase Order Lines Excel template. Supports Haymans, Cetnaj, Ideal
-Electrical, Process Systems (valvesonline.com.au), APS Industrial,
-IPD Group, Phoenix Contact, Mechtric, NHP, and Dore Electrics layouts —
-auto-detected from PDF content.
+app.py — Streamlit web app for converting supplier PDF quotes into two
+Excel files: a Purchase Order Lines file and a Catalogue Lines file, both
+formatted for system import. Supports Haymans, Cetnaj, Ideal Electrical,
+Process Systems (valvesonline.com.au), APS Industrial, IPD Group, Phoenix
+Contact, Mechtric, NHP, and Dore Electrics layouts — auto-detected from
+PDF content. An existing Purchase Order Lines .xlsx can also be uploaded
+directly to re-generate its Catalogue Lines file.
 """
 
 import base64
@@ -14,7 +16,7 @@ from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from quote_to_excel import parse_quote_pdf
@@ -151,6 +153,75 @@ def parse_pdf_bytes(pdf_bytes: bytes, _file_hash: str):
     return parse_quote_pdf(pdf_bytes)
 
 
+# --- Purchase Order Lines (.xlsx) → items --------------------------------
+#
+# Lets the app re-convert an existing Purchase Order Lines export into a
+# Catalogue file, in addition to parsing supplier PDFs. Column positions
+# below are 0-based and match the PO_HEADERS layout.
+
+_PO_COL_PART = 1      # B — Part No on catalogue line
+_PO_COL_ACTIVITY = 2  # C — Activity Code
+_PO_COL_DESC = 4      # E — Description
+_PO_COL_QTY = 6       # G — Quantity
+_PO_COL_UNIT = 7      # H — Unit
+_PO_COL_COST = 8      # I — Unit Cost
+
+
+def parse_po_xlsx(xlsx_bytes: bytes):
+    """Read a Purchase Order Lines .xlsx back into the item-dict format.
+
+    Returns the same shape the PDF parsers produce, so the preview, subtotal,
+    and catalogue build downstream work unchanged. Unit Cost in the PO template
+    is already a per-single-unit price, so unit_price is taken as-is with
+    per == 1. Each row carries its own Activity Code (column C) on the item so
+    the catalogue keeps it per-row rather than from the UI field. Rows without
+    a part number or a numeric cost (blanks, totals, footers) are skipped.
+    """
+    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+    ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
+
+    def _clean(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    items = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        cells = list(row) + [None] * (9 - len(row))
+        part = _clean(cells[_PO_COL_PART])
+        cost = cells[_PO_COL_COST]
+        if part is None or cost in (None, ""):
+            continue
+        try:
+            unit_price = float(cost)
+        except (TypeError, ValueError):
+            continue
+        qty = cells[_PO_COL_QTY]
+        try:
+            qty = int(qty) if qty not in (None, "") else 1
+        except (TypeError, ValueError):
+            qty = 1
+        unit = _clean(cells[_PO_COL_UNIT])
+        items.append({
+            "part": part,
+            "description": _clean(cells[_PO_COL_DESC]),
+            "qty": qty,
+            "uom": unit.upper() if unit else None,
+            "unit_price": unit_price,
+            "per": 1,
+            "supplier": None,
+            "activity_code": _clean(cells[_PO_COL_ACTIVITY]),
+        })
+    return items
+
+
+@st.cache_data(show_spinner=False)
+def parse_po_xlsx_bytes(xlsx_bytes: bytes, _file_hash: str):
+    """Cached wrapper mirroring parse_pdf_bytes, for PO .xlsx uploads."""
+    return parse_po_xlsx(xlsx_bytes)
+
+
 def build_po_xlsx(items, job_code: str, activity_code: str) -> bytes:
     """Write items into the Purchase Order Lines template layout in memory."""
     wb = Workbook()
@@ -218,6 +289,9 @@ def build_catalogue_xlsx(items, activity_code: str) -> bytes:
     All other columns are left blank for the user to fill in if needed.
     Items without a part number (e.g. generic Haymans 'Freight' rows) are
     skipped entirely — the catalogue is for physical stocked items.
+
+    Rows are de-duplicated by Catalogue Part No: a part appearing on multiple
+    PO lines yields a single catalogue row (first occurrence wins).
     """
     wb = Workbook()
     ws = wb.active
@@ -231,19 +305,26 @@ def build_catalogue_xlsx(items, activity_code: str) -> bytes:
         cell.alignment = Alignment(wrap_text=True, vertical="center")
     ws.row_dimensions[1].height = 45
 
-    # Data rows
+    # Data rows — dedupe by part number. The same part can appear on several
+    # PO lines (e.g. the same MCB used across multiple cells); the catalogue
+    # holds one row per stocked part, so the first occurrence wins and later
+    # repeats are skipped. No-part rows (freight etc.) are skipped entirely.
+    seen_parts = set()
     for it in items:
         part = it["part"]
         if not part:
             # Skip rows with no part number (generic 'Freight' lines etc.)
             continue
+        if part in seen_parts:
+            continue
+        seen_parts.add(part)
         unit_cost = it["unit_price"] / it["per"]
         supplier_part = _supplier_part_no(part, it.get("supplier"))
         row = [None] * 23
         row[0] = part                                            # A — Catalogue Part No
         row[1] = supplier_part or None                           # B — Supplier Part No
         row[2] = _truncate_description(it["description"]) or None  # C — Description (100 char cap)
-        row[3] = activity_code or None                           # D — Activity Code
+        row[3] = it.get("activity_code") or activity_code or None  # D — Activity Code
         row[7] = unit_cost                                       # H — Cost Rate
         row[9] = it["uom"] or None                               # J — Unit
         row[22] = DEFAULT_CURRENCY                               # W — Currency Code
@@ -278,7 +359,7 @@ with col2:
 
 uploaded = st.file_uploader(
     "Choose a quote PDF",
-    type=["pdf"],
+    type=["pdf", "xlsx"],
     accept_multiple_files=False,
 )
 
@@ -289,10 +370,16 @@ if uploaded is None:
 
 pdf_bytes = uploaded.getvalue()
 file_hash = hashlib.sha1(pdf_bytes).hexdigest()
+# An uploaded .xlsx is treated as an existing Purchase Order Lines file to be
+# re-converted into a Catalogue; anything else is parsed as a supplier PDF.
+is_po_xlsx = Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm")
 
 with st.spinner("Reading PDF…"):
     try:
-        items = parse_pdf_bytes(pdf_bytes, file_hash)
+        if is_po_xlsx:
+            items = parse_po_xlsx_bytes(pdf_bytes, file_hash)
+        else:
+            items = parse_pdf_bytes(pdf_bytes, file_hash)
     except Exception as exc:
         st.error(f"Couldn't parse that PDF: {exc}")
         st.stop()
@@ -337,8 +424,13 @@ st.dataframe(
     hide_index=True,
 )
 
-# Build both xlsx files in memory
-po_xlsx_bytes = build_po_xlsx(items, job_code.strip(), activity_code.strip())
+# Build both xlsx files in memory. When the upload is already a PO file, pass
+# it straight through as the PO download (lossless) and derive the Catalogue
+# from it; otherwise build the PO from the parsed items as before.
+if is_po_xlsx:
+    po_xlsx_bytes = pdf_bytes
+else:
+    po_xlsx_bytes = build_po_xlsx(items, job_code.strip(), activity_code.strip())
 catalogue_xlsx_bytes = build_catalogue_xlsx(items, activity_code.strip())
 
 # Filenames mirror the input PDF
