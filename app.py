@@ -20,7 +20,14 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from quote_to_excel import parse_quote_pdf
-import supabase_store
+
+# Storage is optional and must never take the app down. If the module or its
+# dependency (supabase) is missing, logging is silently disabled and the
+# converter keeps working.
+try:
+    import supabase_store
+except Exception:
+    supabase_store = None
 
 
 # --- Constants matching the Purchase Order Lines template ----------------
@@ -532,7 +539,9 @@ catalogue_out_name = pdf_stem + "-Catalogue.xlsx"
 # isn't configured or a write fails, the app carries on and the user still
 # gets their files. Verify saved records in the Supabase dashboard.
 _logged = st.session_state.setdefault("_logged_hashes", set())
-if file_hash not in _logged and supabase_store.is_configured():
+if (supabase_store is not None
+        and file_hash not in _logged
+        and supabase_store.is_configured()):
     saved = supabase_store.store_conversion(
         file_hash=file_hash,
         source_filename=uploaded.name,

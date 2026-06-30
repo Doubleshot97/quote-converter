@@ -1,3 +1,15 @@
-streamlit>=1.30
-pdfplumber>=0.10
-openpyxl>=3.1
+# Pin every dependency so the deployed build matches what you run locally.
+# pdfminer.six is the actual PDF text-extraction engine underneath pdfplumber
+# — leaving it unpinned is the classic "works on my machine, breaks once
+# deployed" trap, because a newer pdfminer.six lays out text (and stray
+# watermark glyphs) differently.
+#
+# Best practice: capture your own working versions with `pip freeze` and copy
+# the lines below from that output. Set streamlit to whatever your local
+# env reports.
+
+streamlit            # <-- pin this: run  pip freeze | grep -i streamlit
+pdfplumber==0.11.9
+pdfminer.six==20251230
+openpyxl==3.1.5
+supabase==2.31.0
