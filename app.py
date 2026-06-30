@@ -233,6 +233,13 @@ def _parse_po_lines_sheet(ws):
     return items
 
 
+# Price & Availability exports in this layout are Schneider's website
+# download. Tagging the supplier keeps the stored metadata consistent; it
+# does NOT trigger the Haymans/Cetnaj/Ideal prefix-strip, so catalogue
+# column B stays blank as before.
+_PA_SUPPLIER = "schneider"
+
+
 def _parse_price_availability_sheet(ws, headers):
     """Read a supplier Price & Availability export into items.
 
@@ -275,7 +282,7 @@ def _parse_price_availability_sheet(ws, headers):
             "uom": _normalise_uom(_xlsx_clean(g(cells, c_uom))),
             "unit_price": unit_price,
             "per": 1,
-            "supplier": None,
+            "supplier": _PA_SUPPLIER,
         })
     return items
 
