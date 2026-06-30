@@ -20,6 +20,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from quote_to_excel import parse_quote_pdf
+import supabase_store
 
 
 # --- Constants matching the Purchase Order Lines template ----------------
@@ -153,12 +154,17 @@ def parse_pdf_bytes(pdf_bytes: bytes, _file_hash: str):
     return parse_quote_pdf(pdf_bytes)
 
 
-# --- Purchase Order Lines (.xlsx) → items --------------------------------
+# --- Spreadsheet (.xlsx) inputs → items ----------------------------------
 #
-# Lets the app re-convert an existing Purchase Order Lines export into a
-# Catalogue file, in addition to parsing supplier PDFs. Column positions
-# below are 0-based and match the PO_HEADERS layout.
+# Two spreadsheet shapes are supported in addition to supplier PDFs:
+#   * "po_lines"            — an existing Purchase Order Lines export, re-
+#                             converted into a Catalogue file.
+#   * "price_availability"  — a supplier Price & Availability export.
+# parse_xlsx() sniffs the header row and routes to the right reader. Both
+# return the same item-dict shape the PDF parsers produce, so the preview,
+# subtotal, PO and Catalogue builds downstream are unchanged.
 
+# Purchase Order Lines layout — 0-based column positions matching PO_HEADERS.
 _PO_COL_PART = 1      # B — Part No on catalogue line
 _PO_COL_ACTIVITY = 2  # C — Activity Code
 _PO_COL_DESC = 4      # E — Description
@@ -167,29 +173,46 @@ _PO_COL_UNIT = 7      # H — Unit
 _PO_COL_COST = 8      # I — Unit Cost
 
 
-def parse_po_xlsx(xlsx_bytes: bytes):
-    """Read a Purchase Order Lines .xlsx back into the item-dict format.
+def _xlsx_clean(v):
+    """Trim a cell to a non-empty string, or None."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
 
-    Returns the same shape the PDF parsers produce, so the preview, subtotal,
-    and catalogue build downstream work unchanged. Unit Cost in the PO template
-    is already a per-single-unit price, so unit_price is taken as-is with
-    per == 1. Each row carries its own Activity Code (column C) on the item so
-    the catalogue keeps it per-row rather than from the UI field. Rows without
-    a part number or a numeric cost (blanks, totals, footers) are skipped.
+
+# Unit-of-measure codes that mean "each" and normalise to EA (the system's
+# convention). Anything else is passed through uppercased so genuine units
+# like M (metre) or KG survive.
+_EACH_UOMS = {"EA", "EACH", "PCE", "PC", "PCS", "PIECE", "NO", "UN", "UNIT"}
+
+
+def _normalise_uom(uom):
+    if not uom:
+        return None
+    u = str(uom).strip().upper()
+    return "EA" if u in _EACH_UOMS else (u or None)
+
+
+def _to_int_qty(v):
+    try:
+        return int(float(v)) if v not in (None, "") else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _parse_po_lines_sheet(ws):
+    """Read a Purchase Order Lines sheet into items.
+
+    Unit Cost in the PO template is already a per-single-unit price, so
+    unit_price is taken as-is with per == 1. Each row carries its own Activity
+    Code (column C) so the catalogue keeps it per-row. Rows without a part
+    number or a numeric cost (blanks, totals, footers) are skipped.
     """
-    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
-    ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
-
-    def _clean(v):
-        if v is None:
-            return None
-        s = str(v).strip()
-        return s or None
-
     items = []
     for row in ws.iter_rows(min_row=2, values_only=True):
         cells = list(row) + [None] * (9 - len(row))
-        part = _clean(cells[_PO_COL_PART])
+        part = _xlsx_clean(cells[_PO_COL_PART])
         cost = cells[_PO_COL_COST]
         if part is None or cost in (None, ""):
             continue
@@ -197,29 +220,84 @@ def parse_po_xlsx(xlsx_bytes: bytes):
             unit_price = float(cost)
         except (TypeError, ValueError):
             continue
-        qty = cells[_PO_COL_QTY]
-        try:
-            qty = int(qty) if qty not in (None, "") else 1
-        except (TypeError, ValueError):
-            qty = 1
-        unit = _clean(cells[_PO_COL_UNIT])
         items.append({
             "part": part,
-            "description": _clean(cells[_PO_COL_DESC]),
-            "qty": qty,
-            "uom": unit.upper() if unit else None,
+            "description": _xlsx_clean(cells[_PO_COL_DESC]),
+            "qty": _to_int_qty(cells[_PO_COL_QTY]),
+            "uom": _normalise_uom(_xlsx_clean(cells[_PO_COL_UNIT])),
             "unit_price": unit_price,
             "per": 1,
             "supplier": None,
-            "activity_code": _clean(cells[_PO_COL_ACTIVITY]),
+            "activity_code": _xlsx_clean(cells[_PO_COL_ACTIVITY]),
         })
     return items
 
 
+def _parse_price_availability_sheet(ws, headers):
+    """Read a supplier Price & Availability export into items.
+
+    Columns are matched by header name (robust to re-ordering). 'Unit Net
+    Price' is the ex-GST per-unit cost; 'Qty' is the line quantity. Rows
+    without a part number or a numeric net price are skipped.
+    """
+    idx = {h.strip().lower(): i for i, h in enumerate(headers) if h}
+
+    def col(*names):
+        for n in names:
+            if n.lower() in idx:
+                return idx[n.lower()]
+        return None
+
+    c_part = col("Part No.", "Part No", "Part Number")
+    c_desc = col("Description")
+    c_qty = col("Qty", "Quantity")
+    c_price = col("Unit Net Price", "Net Price")
+    c_uom = col("Unit of Measure", "UOM", "Unit")
+
+    def g(cells, i):
+        return cells[i] if (i is not None and i < len(cells)) else None
+
+    items = []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        cells = list(row)
+        part = _xlsx_clean(g(cells, c_part))
+        price = g(cells, c_price)
+        if part is None or price in (None, ""):
+            continue
+        try:
+            unit_price = float(price)
+        except (TypeError, ValueError):
+            continue
+        items.append({
+            "part": part,
+            "description": _xlsx_clean(g(cells, c_desc)),
+            "qty": _to_int_qty(g(cells, c_qty)),
+            "uom": _normalise_uom(_xlsx_clean(g(cells, c_uom))),
+            "unit_price": unit_price,
+            "per": 1,
+            "supplier": None,
+        })
+    return items
+
+
+def parse_xlsx(xlsx_bytes: bytes):
+    """Detect the spreadsheet shape and parse it. Returns (kind, items)."""
+    wb = load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+    ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
+    headers = [(str(c.value).strip() if c.value is not None else "")
+               for c in ws[1]]
+    hset = {h.lower() for h in headers}
+    # Price & Availability exports carry a 'Unit Net Price' column; the PO
+    # Lines template does not. That's the distinguishing signature.
+    if "unit net price" in hset and "part no." in hset:
+        return "price_availability", _parse_price_availability_sheet(ws, headers)
+    return "po_lines", _parse_po_lines_sheet(ws)
+
+
 @st.cache_data(show_spinner=False)
-def parse_po_xlsx_bytes(xlsx_bytes: bytes, _file_hash: str):
-    """Cached wrapper mirroring parse_pdf_bytes, for PO .xlsx uploads."""
-    return parse_po_xlsx(xlsx_bytes)
+def parse_xlsx_bytes(xlsx_bytes: bytes, _file_hash: str):
+    """Cached wrapper mirroring parse_pdf_bytes, for .xlsx uploads."""
+    return parse_xlsx(xlsx_bytes)
 
 
 def build_po_xlsx(items, job_code: str, activity_code: str) -> bytes:
@@ -370,16 +448,16 @@ if uploaded is None:
 
 pdf_bytes = uploaded.getvalue()
 file_hash = hashlib.sha1(pdf_bytes).hexdigest()
-# An uploaded .xlsx is treated as an existing Purchase Order Lines file to be
-# re-converted into a Catalogue; anything else is parsed as a supplier PDF.
-is_po_xlsx = Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm")
+# An uploaded .xlsx is sniffed and routed (PO Lines vs Price & Availability);
+# anything else is parsed as a supplier PDF.
+is_xlsx = Path(uploaded.name).suffix.lower() in (".xlsx", ".xlsm")
 
 with st.spinner("Reading PDF…"):
     try:
-        if is_po_xlsx:
-            items = parse_po_xlsx_bytes(pdf_bytes, file_hash)
+        if is_xlsx:
+            kind, items = parse_xlsx_bytes(pdf_bytes, file_hash)
         else:
-            items = parse_pdf_bytes(pdf_bytes, file_hash)
+            kind, items = "pdf", parse_pdf_bytes(pdf_bytes, file_hash)
     except Exception as exc:
         st.error(f"Couldn't parse that PDF: {exc}")
         st.stop()
@@ -424,10 +502,11 @@ st.dataframe(
     hide_index=True,
 )
 
-# Build both xlsx files in memory. When the upload is already a PO file, pass
-# it straight through as the PO download (lossless) and derive the Catalogue
-# from it; otherwise build the PO from the parsed items as before.
-if is_po_xlsx:
+# Build both xlsx files in memory. A PO Lines upload is passed straight
+# through as the PO download (lossless) and only the Catalogue is derived;
+# every other input (PDF or Price & Availability) builds a fresh PO from the
+# parsed items.
+if kind == "po_lines":
     po_xlsx_bytes = pdf_bytes
 else:
     po_xlsx_bytes = build_po_xlsx(items, job_code.strip(), activity_code.strip())
@@ -437,6 +516,33 @@ catalogue_xlsx_bytes = build_catalogue_xlsx(items, activity_code.strip())
 pdf_stem = Path(uploaded.name).stem
 po_out_name = pdf_stem + "-PO.xlsx"
 catalogue_out_name = pdf_stem + "-Catalogue.xlsx"
+
+# --- Persist this conversion to private Supabase storage -----------------
+#
+# Logged once per uploaded file. Streamlit re-runs this whole script on every
+# interaction (e.g. a download click), so we guard on file_hash in
+# session_state to avoid duplicate rows. Storage is fail-soft: if Supabase
+# isn't configured or a write fails, the app carries on and the user still
+# gets their files. Verify saved records in the Supabase dashboard.
+_logged = st.session_state.setdefault("_logged_hashes", set())
+if file_hash not in _logged and supabase_store.is_configured():
+    saved = supabase_store.store_conversion(
+        file_hash=file_hash,
+        source_filename=uploaded.name,
+        input_type="po_xlsx" if kind == "po_lines" else kind,
+        supplier=(items[0].get("supplier") if items else None),
+        job_code=job_code.strip(),
+        activity_code=activity_code.strip(),
+        line_count=len(items),
+        subtotal_ex_gst=subtotal,
+        catalogue_row_count=len({it["part"] for it in items if it.get("part")}),
+        po_bytes=po_xlsx_bytes,
+        po_name=po_out_name,
+        catalogue_bytes=catalogue_xlsx_bytes,
+        catalogue_name=catalogue_out_name,
+    )
+    if saved:
+        _logged.add(file_hash)
 
 # --- Single "Download both" button -------------------------------------
 #
