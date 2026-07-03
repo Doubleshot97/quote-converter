@@ -91,7 +91,7 @@ DEFAULT_WORK_CENTRE = "WC004"
 # Suppliers whose part numbers carry a 3-character prefix that should be
 # stripped to produce the "Supplier Part No" (column B in the catalogue).
 # Example: "SPFCTR-60C-5R" → "CTR-60C-5R" (Haymans/Cetnaj convention).
-_PREFIX_STRIP_SUPPLIERS = {"haymans", "cetnaj", "ideal"}
+_PREFIX_STRIP_SUPPLIERS = {"haymans", "cetnaj", "ideal", "lawrence_hanson"}
 
 # Pattern matching freight-charge codes for Haymans / Cetnaj, e.g.
 # "SPF-FREIGHT", "BUN-FREIGHT", "APS-FREIGHT". These look like real part
@@ -128,6 +128,10 @@ def _supplier_part_no(part: str, supplier: str | None) -> str:
         return ""
     # Haymans / Cetnaj freight codes like "SPF-FREIGHT" stay blank.
     if supplier in ("haymans", "cetnaj") and _FREIGHT_PART_RE.match(part):
+        return ""
+    # Lawrence & Hanson delivery-charge codes (e.g. "BURDELIVERY-BURNDY-BU")
+    # are not stocked parts — leave column B blank.
+    if supplier == "lawrence_hanson" and "DELIVERY" in part.upper():
         return ""
     if len(part) <= 3:
         return ""

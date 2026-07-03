@@ -1061,6 +1061,53 @@ def _parse_dore(lines):
 
 # A "signature" is a regex that, if found anywhere in the PDF text,
 # identifies which supplier it is.
+
+# =========================================================================
+# LAWRENCE & HANSON PARSER
+# =========================================================================
+#
+# Electrical wholesaler (Sonepar). Layout: "Line Part Description EA Qty
+# UnitPrice Per Disc ExtValue". pdfplumber often splits the quantity digits
+# with stray spaces (e.g. "3 3" for 33), so quantity is derived from
+# ExtValue / (UnitPrice / Per), which reconciles exactly to the PDF.
+# Each item line is followed by a secondary numeric code line (e.g.
+# "6133524038") which is ignored — it never matches the item regex.
+
+LH_ITEM_RE = re.compile(
+    r"^\s*(?P<line_no>\d{1,4})\s+"
+    r"(?P<part>[A-Z0-9][A-Z0-9\-/\.]+)\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<uom>EA)\s+"
+    r"(?P<qty_raw>[\d\s,]+?)\s+"
+    r"(?P<unit_price>[\d,]+\.\d{2})\s+"
+    r"(?P<per>\d+)\s+\S+\s+"
+    r"(?P<ext>[\d,]+\.\d{2})\s*$"
+)
+
+
+def _parse_lawrence_hanson(lines):
+    items = []
+    for line in lines:
+        m = LH_ITEM_RE.match(line)
+        if not m:
+            continue
+        unit_price = _to_number(m.group("unit_price"))
+        per = int(m.group("per")) or 1
+        ext = _to_number(m.group("ext"))
+        per_unit = unit_price / per
+        qty = int(round(ext / per_unit)) if per_unit else 1
+        items.append({
+            "part": m.group("part").strip(),
+            "description": m.group("desc").strip(),
+            "qty": qty,
+            "uom": "EA",
+            "unit_price": unit_price,
+            "per": per,
+            "supplier": "lawrence_hanson",
+        })
+    return items
+
+
 SUPPLIER_SIGNATURES = [
     ("ideal",   re.compile(r"Ideal\s+Electrical|idealelectrical\.com", re.IGNORECASE)),
     ("haymans", re.compile(r"Haymans\s+Electrical|mmem\.com\.au", re.IGNORECASE)),
@@ -1075,6 +1122,8 @@ SUPPLIER_SIGNATURES = [
                 re.compile(r"Mechtric\s+Pty|mechtric\.com", re.IGNORECASE)),
     ("nhp",     re.compile(r"NHP\s+Electrical|nhp\.com\.au", re.IGNORECASE)),
     ("dore",    re.compile(r"Dore\s+Electrics|doreelectrics\.com", re.IGNORECASE)),
+    ("lawrence_hanson",
+                re.compile(r"Lawrence\s*&\s*Hanson|lh\.com\.au", re.IGNORECASE)),
 ]
 
 
@@ -1121,6 +1170,8 @@ def parse_quote_pdf(pdf_source):
         items = _parse_nhp(lines)
     elif supplier == "dore":
         items = _parse_dore(lines)
+    elif supplier == "lawrence_hanson":
+        items = _parse_lawrence_hanson(lines)
     else:
         # Haymans, Cetnaj, and unknown fallback all use the same parser.
         items = _parse_haymans(lines)
