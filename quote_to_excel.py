@@ -92,7 +92,7 @@ HAYMANS_ITEM_RE = re.compile(
     r"""^\s*
         (?P<line_no>\d+)\s+              # line number (e.g. 5, 10, 15)
         \#?                              # optional leading '#' marker (stripped)
-        (?P<part>[A-Z0-9][A-Z0-9\-/.+]*)\s+  # part number (alphanumeric, -, /, ., +)
+        (?P<part>[A-Z0-9][A-Z0-9\-/.+()]*)\s+  # part number (alphanumeric, -, /, ., +, parens)
         (?P<qty>[\d,]+\.\d+)\s+          # quantity (e.g. 1.000)
         (?P<uom>[A-Za-z]{1,4})\s+        # unit of measure
         (?P<unit_price>[\d,]+\.\d+)\s+   # unit price
@@ -1108,6 +1108,98 @@ def _parse_lawrence_hanson(lines):
     return items
 
 
+
+# =========================================================================
+# PROCHEM PIPELINE PRODUCTS PARSER
+# =========================================================================
+#
+# Layout: "ItemCode Description Qty UOM ItemPrice GST LineTotal" where
+# ItemPrice is the ex-GST unit (3dp) and LineTotal is INC GST. Freight rows
+# (e.g. "HO7230.P Freight Outwards") have no UOM column. Long descriptions
+# wrap onto a continuation line that follows the item line and is appended.
+# UOM is kept verbatim as "EACH" (per TEW convention for this supplier).
+
+PROCHEM_ITEM_RE = re.compile(
+    r"^\s*(?P<part>[A-Z][A-Z0-9\-\./]+)\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<qty>\d+(?:\.\d+)?)\s+"
+    r"(?:(?P<uom>[A-Z]{2,6})\s+)?"
+    r"(?P<unit_price>[\d,]+\.\d{2,3})\s+"
+    r"(?P<gst>[\d,]+\.\d{2})\s+"
+    r"(?P<line_total>[\d,]+\.\d{2})\s*$"
+)
+
+_PROCHEM_STOP_RE = re.compile(r"Sub-total|Special Note|Currency|^Total:", re.IGNORECASE)
+
+
+def _parse_prochem(lines):
+    items = []
+    for line in lines:
+        if _PROCHEM_STOP_RE.search(line):
+            if items:
+                break
+            continue
+        m = PROCHEM_ITEM_RE.match(line)
+        if m:
+            qty = int(round(float(m.group("qty"))))
+            items.append({
+                "part": m.group("part").strip(),
+                "description": m.group("desc").strip(),
+                "qty": qty or 1,
+                "uom": m.group("uom") or None,
+                "unit_price": _to_number(m.group("unit_price")),
+                "per": 1,
+                "supplier": "prochem",
+            })
+        elif items and line.strip() and not any(ch.isdigit() and "." in line for ch in ()) :
+            # Continuation line: short, no price tail — append to last desc.
+            s = line.strip()
+            if len(s) <= 40 and not re.search(r"\d+\.\d{2}\s*$", s):
+                items[-1]["description"] += " " + s
+    return items
+
+
+
+# =========================================================================
+# HACH PACIFIC PARSER
+# =========================================================================
+#
+# Layout: "Line Part Description Qty NetUnitPrice ExtendedPrice", prices ex
+# GST. Component sub-lines ("3.1", "3.2") carry no qty/price and are
+# informational only — requiring an integer line number plus the numeric
+# tail excludes them naturally. Freight rows keep their part code but no
+# unit, matching the manual conversion convention.
+
+HACH_ITEM_RE = re.compile(
+    r"^\s*(?P<line_no>\d+)\s+"
+    r"(?P<part>[A-Z0-9][A-Z0-9\.\-]*)\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<qty>\d+)\s+"
+    r"(?P<unit_price>[\d,]+\.\d{2})\s+"
+    r"(?P<ext>[\d,]+\.\d{2})\s*$"
+)
+
+
+def _parse_hach(lines):
+    items = []
+    for line in lines:
+        m = HACH_ITEM_RE.match(line)
+        if not m:
+            continue
+        desc = m.group("desc").strip()
+        is_freight = "freight" in desc.lower()
+        items.append({
+            "part": m.group("part").strip(),
+            "description": desc,
+            "qty": int(m.group("qty")),
+            "uom": None if is_freight else "EA",
+            "unit_price": _to_number(m.group("unit_price")),
+            "per": 1,
+            "supplier": "hach",
+        })
+    return items
+
+
 SUPPLIER_SIGNATURES = [
     ("ideal",   re.compile(r"Ideal\s+Electrical|idealelectrical\.com", re.IGNORECASE)),
     ("haymans", re.compile(r"Haymans\s+Electrical|mmem\.com\.au", re.IGNORECASE)),
@@ -1124,6 +1216,8 @@ SUPPLIER_SIGNATURES = [
     ("dore",    re.compile(r"Dore\s+Electrics|doreelectrics\.com", re.IGNORECASE)),
     ("lawrence_hanson",
                 re.compile(r"Lawrence\s*&\s*Hanson|lh\.com\.au", re.IGNORECASE)),
+    ("prochem", re.compile(r"Prochem\s+Pipeline|prochem\.com\.au", re.IGNORECASE)),
+    ("hach",    re.compile(r"Hach\s+Pacific|hachpacific\.com|au\.hach\.com", re.IGNORECASE)),
 ]
 
 
@@ -1172,6 +1266,10 @@ def parse_quote_pdf(pdf_source):
         items = _parse_dore(lines)
     elif supplier == "lawrence_hanson":
         items = _parse_lawrence_hanson(lines)
+    elif supplier == "prochem":
+        items = _parse_prochem(lines)
+    elif supplier == "hach":
+        items = _parse_hach(lines)
     else:
         # Haymans, Cetnaj, and unknown fallback all use the same parser.
         items = _parse_haymans(lines)
