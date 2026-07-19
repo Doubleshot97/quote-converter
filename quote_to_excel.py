@@ -1200,6 +1200,47 @@ def _parse_hach(lines):
     return items
 
 
+
+# =========================================================================
+# PRIMARY METALS & ALLOYS PARSER
+# =========================================================================
+#
+# Layout: "ItemNo Description $ExPrice Qty [Unit] $ExAmount GST" where
+# EX PRICE is the ex-GST unit price. Freight rows ("M-0004 Freight") have
+# no unit column. Genuine units like "Lth" (length) are uppercased and
+# kept — only each-type units would be EA, but this supplier sells bar
+# stock by length.
+
+PRIMARY_METALS_ITEM_RE = re.compile(
+    r"^\s*(?P<part>[A-Z0-9]+-[A-Z0-9]+)\s+"
+    r"(?P<desc>.+?)\s+"
+    r"\$(?P<unit_price>[\d,]+\.\d{2})\s+"
+    r"(?P<qty>[\d,]+)\s+"
+    r"(?:(?P<uom>[A-Za-z]{1,6})\s+)?"
+    r"\$(?P<ext>[\d,]+\.\d{2})\s+"
+    r"(?:GST|\*|#)\s*$"
+)
+
+
+def _parse_primary_metals(lines):
+    items = []
+    for line in lines:
+        m = PRIMARY_METALS_ITEM_RE.match(line)
+        if not m:
+            continue
+        uom = m.group("uom")
+        items.append({
+            "part": m.group("part").strip(),
+            "description": m.group("desc").strip(),
+            "qty": int(m.group("qty").replace(",", "")),
+            "uom": uom.upper() if uom else None,
+            "unit_price": _to_number(m.group("unit_price")),
+            "per": 1,
+            "supplier": "primary_metals",
+        })
+    return items
+
+
 SUPPLIER_SIGNATURES = [
     ("ideal",   re.compile(r"Ideal\s+Electrical|idealelectrical\.com", re.IGNORECASE)),
     ("haymans", re.compile(r"Haymans\s+Electrical|mmem\.com\.au", re.IGNORECASE)),
@@ -1218,6 +1259,9 @@ SUPPLIER_SIGNATURES = [
                 re.compile(r"Lawrence\s*&\s*Hanson|lh\.com\.au", re.IGNORECASE)),
     ("prochem", re.compile(r"Prochem\s+Pipeline|prochem\.com\.au", re.IGNORECASE)),
     ("hach",    re.compile(r"Hach\s+Pacific|hachpacific\.com|au\.hach\.com", re.IGNORECASE)),
+    ("primary_metals",
+                re.compile(r"Primary\s+Metals\s*(&|and)\s*Alloys|primarymetals\.com\.au",
+                           re.IGNORECASE)),
 ]
 
 
@@ -1270,6 +1314,8 @@ def parse_quote_pdf(pdf_source):
         items = _parse_prochem(lines)
     elif supplier == "hach":
         items = _parse_hach(lines)
+    elif supplier == "primary_metals":
+        items = _parse_primary_metals(lines)
     else:
         # Haymans, Cetnaj, and unknown fallback all use the same parser.
         items = _parse_haymans(lines)
