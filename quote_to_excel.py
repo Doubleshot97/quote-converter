@@ -92,7 +92,7 @@ HAYMANS_ITEM_RE = re.compile(
     r"""^\s*
         (?P<line_no>\d+)\s+              # line number (e.g. 5, 10, 15)
         \#?                              # optional leading '#' marker (stripped)
-        (?P<part>[A-Z0-9][A-Z0-9\-/.+()]*)\s+  # part number (alphanumeric, -, /, ., +, parens)
+        (?P<part>[A-Z0-9][A-Za-z0-9\-/.+()]*)\s+  # part number (mixed-case alphanumeric, -, /, ., +, parens)
         (?P<qty>[\d,]+\.\d+)\s+          # quantity (e.g. 1.000)
         (?P<uom>[A-Za-z]{1,4})\s+        # unit of measure
         (?P<unit_price>[\d,]+\.\d+)\s+   # unit price
