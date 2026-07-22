@@ -1241,6 +1241,49 @@ def _parse_primary_metals(lines):
     return items
 
 
+
+# =========================================================================
+# BUILD IT FASTENERS PARSER
+# =========================================================================
+#
+# Layout: "PART - DESCRIPTION Qty UnitPrice TotalPrice" with prices ex GST.
+# The part code is everything before the first " - " separator; unit prices
+# can carry 3 decimals (e.g. 0.048 washers). No UOM column and no freight
+# convention observed. Rows are validated qty*unit == total to one cent.
+
+BUILD_IT_ITEM_RE = re.compile(
+    r"^\s*(?P<part>[A-Za-z0-9][A-Za-z0-9\-\./]*)\s+-\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<qty>[\d,]+)\s+"
+    r"(?P<unit_price>[\d,]+\.\d{2,3})\s+"
+    r"(?P<total>[\d,]+\.\d{2})\s*$"
+)
+
+
+def _parse_build_it(lines):
+    items = []
+    for line in lines:
+        m = BUILD_IT_ITEM_RE.match(line)
+        if not m:
+            continue
+        qty = int(m.group("qty").replace(",", ""))
+        unit_price = _to_number(m.group("unit_price"))
+        total = _to_number(m.group("total"))
+        # Guard against header-ish false positives: line must reconcile.
+        if abs(qty * unit_price - total) > 0.011:
+            continue
+        items.append({
+            "part": m.group("part").strip(),
+            "description": m.group("desc").strip(),
+            "qty": qty,
+            "uom": None,
+            "unit_price": unit_price,
+            "per": 1,
+            "supplier": "build_it",
+        })
+    return items
+
+
 SUPPLIER_SIGNATURES = [
     ("ideal",   re.compile(r"Ideal\s+Electrical|idealelectrical\.com", re.IGNORECASE)),
     ("haymans", re.compile(r"Haymans\s+Electrical|mmem\.com\.au", re.IGNORECASE)),
@@ -1259,6 +1302,8 @@ SUPPLIER_SIGNATURES = [
                 re.compile(r"Lawrence\s*&\s*Hanson|lh\.com\.au", re.IGNORECASE)),
     ("prochem", re.compile(r"Prochem\s+Pipeline|prochem\.com\.au", re.IGNORECASE)),
     ("hach",    re.compile(r"Hach\s+Pacific|hachpacific\.com|au\.hach\.com", re.IGNORECASE)),
+    ("build_it",
+                re.compile(r"Build\s+It\s+Fasteners", re.IGNORECASE)),
     ("primary_metals",
                 re.compile(r"Primary\s+Metals\s*(&|and)\s*Alloys|primarymetals\.com\.au",
                            re.IGNORECASE)),
@@ -1316,6 +1361,8 @@ def parse_quote_pdf(pdf_source):
         items = _parse_hach(lines)
     elif supplier == "primary_metals":
         items = _parse_primary_metals(lines)
+    elif supplier == "build_it":
+        items = _parse_build_it(lines)
     else:
         # Haymans, Cetnaj, and unknown fallback all use the same parser.
         items = _parse_haymans(lines)
